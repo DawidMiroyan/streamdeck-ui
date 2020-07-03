@@ -21,8 +21,8 @@ from streamdeck_ui import api
 from streamdeck_ui.config import LOGO, PROJECT_PATH
 from streamdeck_ui.ui_main import Ui_MainWindow
 
-BUTTON_SYTLE = """
-    QToolButton{background-color:black;}
+BUTTON_STYLE = """
+    QToolButton{background-color:#646464;}
     QToolButton:checked{background-color:darkGray;}
     QToolButton:focus{border:none; }
 """
@@ -84,12 +84,14 @@ def change_page(ui, page: int) -> None:
 
 def select_image(window) -> None:
     file_name = QFileDialog.getOpenFileName(
-        window, "Open Image", os.path.expanduser("~"), "Image Files (*.png *.jpg *.bmp)"
+        window, "Open Image", os.path.expanduser("~"), "Image Files (*.png *.jpg *.bmp *.ico *.gif)"
     )[0]
     deck_id = _deck_id(window.ui)
     api.set_button_icon(deck_id, _page(window.ui), selected_button.index, file_name)
     redraw_buttons(window.ui)
 
+def drop_image(window) -> None:
+    pass
 
 def redraw_buttons(ui) -> None:
     deck_id = _deck_id(ui)
@@ -111,9 +113,7 @@ def button_clicked(ui, clicked_button, buttons) -> None:
     for button in buttons:
         if button == clicked_button:
             continue
-
         button.setChecked(False)
-
     deck_id = _deck_id(ui)
     button_id = selected_button.index
     ui.text.setText(api.get_button_text(deck_id, _page(ui), button_id))
@@ -150,7 +150,7 @@ def build_buttons(ui, tab) -> None:
             button.setSizePolicy(QSizePolicy.MinimumExpanding, QSizePolicy.MinimumExpanding)
             button.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
             button.setIconSize(QSize(100, 100))
-            button.setStyleSheet(BUTTON_SYTLE)
+            button.setStyleSheet(BUTTON_STYLE)
             buttons.append(button)
             column_layout.addWidget(button)
             index += 1
