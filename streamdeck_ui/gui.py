@@ -279,6 +279,7 @@ def start(_exit: bool = False) -> None:
     timer.start(1000)
 
     api.render()
+    api.spawn_render_thread()
     tray.show()
     main_window.show()
     if _exit:

@@ -1,13 +1,16 @@
 """Defines the Python API for interacting with the StreamDeck Configuration UI"""
 import json
 import os
+import time
 import threading
+import itertools
 from functools import partial
 from subprocess import Popen  # nosec - Need to allow users to specify arbitrary commands
+from datetime import datetime
 from typing import Dict, List, Tuple, Union
 from warnings import warn
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageSequence, ImageDraw, ImageFont
 from pynput.keyboard import Controller, Key
 from StreamDeck import DeviceManager, ImageHelpers
 from StreamDeck.Devices import StreamDeck
@@ -15,10 +18,14 @@ from StreamDeck.ImageHelpers import PILHelper
 
 from streamdeck_ui.config import CONFIG_FILE_VERSION, DEFAULT_FONT, FONTS_PATH, STATE_FILE
 
-image_cache: Dict[str, memoryview] = {}
+image_cache: Dict[str, Union[memoryview, Union[float, Union[int, int]]]] = {}
 decks: Dict[str, StreamDeck.StreamDeck] = {}
 state: Dict[str, Dict[str, Union[int, Dict[int, Dict[int, Dict[str, str]]]]]] = {}
 
+pill2kill = threading.Event()
+render_threads = []
+FRAMES_PER_SECOND = 60
+lock = threading.Lock()
 
 def _key_change_callback(deck_id: str, _deck: StreamDeck.StreamDeck, key: int, state: bool) -> None:
     if state:
@@ -249,9 +256,60 @@ def set_page(deck_id: str, page: int) -> None:
     render()
     _save_state()
 
+def spawn_render_thread() -> None:
+    thread = threading.Thread(target=render_thread)
+    thread.start()
+    
+# Combine all render threads into 1
+# Compute time when to draw next frame, if time passed during iterations, draw it
+
+# Do in chunks
+# First get current time
+# If time passed:
+#  Draw and compute next time
+
+# On new render:
+#   update all time to current time, reset frames
+
+def render_thread() -> None:
+    t = threading.currentThread()
+    i = 0
+    while getattr(t, "do_run", True):
+        # Store current time for next draw calc
+        current_time = round(time.monotonic() * 1000)
+
+        # Draw on each deck
+        lock.acquire()
+        for deck_id, deck_state in state.items():
+            deck = decks.get(deck_id, None)
+            if not deck:
+                continue
+
+            page = get_page(deck_id)
+            for button_id, button_settings in (
+                deck_state.get("buttons", {}).get(page, {}).items()  # type: ignore
+            ):
+                key = f"{deck_id}.{page}.{button_id}"
+
+                if key in image_cache:
+                    image, fps, next_time, frame = image_cache[key]
+                    # Time to draw next frame passed
+                    if fps != 0 and current_time >= next_time:
+                        # Update the key images with the next animation frame.
+                        next_time = current_time + (1000/fps)
+                        
+                        image_cache[key] = [image, fps, next_time, (frame+1)%len(image)] # Update image frame
+                        deck.set_key_image(button_id, image[frame]) # Draw current frame
+                                
+                    elif fps == 0 and next_time == 0:
+                        image_cache[key] = [image, fps, -1.0, (frame+1)%len(image)] # Update image frame
+                        deck.set_key_image(button_id, image[frame]) # Draw current frame
+        lock.release()
+        time.sleep(1/100)
 
 def render() -> None:
     """renders all decks"""
+    lock.acquire()
     for deck_id, deck_state in state.items():
         deck = decks.get(deck_id, None)
         if not deck:
@@ -263,43 +321,69 @@ def render() -> None:
             deck_state.get("buttons", {}).get(page, {}).items()  # type: ignore
         ):
             key = f"{deck_id}.{page}.{button_id}"
-            if key in image_cache:
-                image = image_cache[key]
+            # Not updating all causes sync issues in the gifs themselves
+            if key not in image_cache:
+                image, fps = _render_key_image(deck, **button_settings)
+                image_cache[key] = [image, fps, 0.0, 0] # Start on frame 0
             else:
-                image = _render_key_image(deck, **button_settings)
-                image_cache[key] = image
-            deck.set_key_image(button_id, image)
-
+                image, fps, *rest = image_cache[key]
+                image_cache[key] = [image, fps, 0.0, 0]
+    lock.release()
 
 def _render_key_image(deck, icon: str = "", text: str = "", font: str = DEFAULT_FONT, **kwargs):
     """Renders an individual key image"""
-    image = ImageHelpers.PILHelper.create_image(deck)
-    draw = ImageDraw.Draw(image)
+    icon_frames = list()
 
     if icon:
-        rgba_icon = Image.open(icon).convert("RGBA")
-    else:
-        rgba_icon = Image.new("RGBA", (300, 300))
-
-    icon_width, icon_height = image.width, image.height
-    if text:
-        icon_height -= 20
-
-    rgba_icon.thumbnail((icon_width, icon_height), Image.LANCZOS)
-    icon_pos = ((image.width - rgba_icon.width) // 2, 0)
-    image.paste(rgba_icon, icon_pos, rgba_icon)
-
-    if text:
-        true_font = ImageFont.truetype(os.path.join(FONTS_PATH, font), 14)
-        label_w, label_h = draw.textsize(text, font=true_font)
-        if icon:
-            label_pos = ((image.width - label_w) // 2, image.height - 20)
+        icons = Image.open(icon)
+        frames = ImageSequence.Iterator(icons)
+        
+        if 'duration' in icons.info.keys():
+            fps = 1000 / icons.info['duration'] # https://stackoverflow.com/questions/53364769/get-frames-per-second-of-a-gif-in-python
         else:
-            label_pos = ((image.width - label_w) // 2, (image.height // 2) - 7)
-        draw.text(label_pos, text=text, font=true_font, fill="white")
+            fps = 0
+    else:
+        fps = 0
+        frames = ImageSequence.Iterator(Image.new("RGBA", (300, 300)))
+    
 
-    return ImageHelpers.PILHelper.to_native_format(deck, image)
+    for frame in frames:
+        image = ImageHelpers.PILHelper.create_image(deck)
+        draw = ImageDraw.Draw(image)
 
+        rgba_icon = frame.convert("RGBA")
+
+        alpha = rgba_icon.split()[-1]
+        bg = Image.new('RGBA', rgba_icon.size, (0,0,0))
+        bg.paste(rgba_icon, mask=alpha)
+        rgba_icon = bg
+
+        icon_width, icon_height = image.width, image.height
+        # Shift image up when text present
+        if text:
+            icon_height -= 20
+
+        rgba_icon.thumbnail((icon_width, icon_height), Image.LANCZOS)
+        icon_pos = ((image.width - rgba_icon.width) // 2, 0)
+        image.paste(rgba_icon, icon_pos, rgba_icon)
+
+        if text:
+            true_font = ImageFont.truetype(os.path.join(FONTS_PATH, font), 14)
+            label_w, label_h = draw.textsize(text, font=true_font)
+            if icon:
+                # This here shifts text down when image present
+                label_pos = ((image.width - label_w) // 2, image.height - 20)
+            else:
+                label_pos = ((image.width - label_w) // 2, (image.height // 2) - 7)
+            draw.text(label_pos, text=text, font=true_font, fill="white")
+
+        # Store the rendered animation frame in the device's native image
+        # format for later use, so we don't need to keep converting it.
+        icon_frames.append(PILHelper.to_native_format(deck, image))
+    
+    # Return an infinite cycle generator that returns the next animation frame
+    # each time it is called.
+    return icon_frames, fps
 
 if os.path.isfile(STATE_FILE):
     _open_config(STATE_FILE)
