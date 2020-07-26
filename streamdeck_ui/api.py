@@ -5,7 +5,7 @@ import time
 import threading
 import itertools
 from functools import partial
-from subprocess import Popen  # nosec - Need to allow users to specify arbitrary commands
+from subprocess import Popen # nosec - Need to allow users to specify arbitrary commands
 from datetime import datetime
 from typing import Dict, List, Tuple, Union
 from warnings import warn
@@ -34,8 +34,10 @@ def _key_change_callback(deck_id: str, _deck: StreamDeck.StreamDeck, key: int, s
 
         command = get_button_command(deck_id, page, key)
         if command:
-            Popen(command.split(" "))
-
+            try:
+                Popen(command.split(" "))
+            except OSError as e:
+                print(e)         
         keys = get_button_keys(deck_id, page, key)
         if keys:
             keys = keys.strip().replace(" ", "")
@@ -260,20 +262,10 @@ def spawn_render_thread() -> None:
     thread = threading.Thread(target=render_thread)
     thread.start()
     
-# Combine all render threads into 1
-# Compute time when to draw next frame, if time passed during iterations, draw it
-
-# Do in chunks
-# First get current time
-# If time passed:
-#  Draw and compute next time
-
-# On new render:
-#   update all time to current time, reset frames
-
 def render_thread() -> None:
     t = threading.currentThread()
-    i = 0
+    rate = 1/100
+
     while getattr(t, "do_run", True):
         # Store current time for next draw calc
         current_time = round(time.monotonic() * 1000)
@@ -296,7 +288,7 @@ def render_thread() -> None:
                     # Time to draw next frame passed
                     if fps != 0 and current_time >= next_time:
                         # Update the key images with the next animation frame.
-                        next_time = current_time + (1000/fps)
+                        next_time = current_time + fps
                         
                         image_cache[key] = [image, fps, next_time, (frame+1)%len(image)] # Update image frame
                         deck.set_key_image(button_id, image[frame]) # Draw current frame
@@ -305,7 +297,7 @@ def render_thread() -> None:
                         image_cache[key] = [image, fps, -1.0, (frame+1)%len(image)] # Update image frame
                         deck.set_key_image(button_id, image[frame]) # Draw current frame
         lock.release()
-        time.sleep(1/100)
+        time.sleep(rate)
 
 def render() -> None:
     """renders all decks"""
@@ -339,7 +331,7 @@ def _render_key_image(deck, icon: str = "", text: str = "", font: str = DEFAULT_
         frames = ImageSequence.Iterator(icons)
         
         if 'duration' in icons.info.keys():
-            fps = 1000 / icons.info['duration'] # https://stackoverflow.com/questions/53364769/get-frames-per-second-of-a-gif-in-python
+            fps = icons.info['duration'] # https://stackoverflow.com/questions/53364769/get-frames-per-second-of-a-gif-in-python
         else:
             fps = 0
     else:
